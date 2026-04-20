@@ -52,6 +52,8 @@ from pathlib import Path
 from typing import Optional
 
 import uvicorn
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse
 from PIL import Image
@@ -59,15 +61,6 @@ from PIL import Image
 from .analyzer import SceneAnalyzer, SceneAnalysis
 
 logger = logging.getLogger(__name__)
-
-app = FastAPI(
-    title="MuJoCo Vision Server",
-    version="1.0.0",
-    description=(
-        "Florence-2 powered scene perception for MuJoCo-CLI. "
-        "Analyses camera images and returns structured object descriptions."
-    ),
-)
 
 # ── Global state ──────────────────────────────────────────────────────────────
 
@@ -77,10 +70,10 @@ _last_image: Optional[Image.Image] = None
 _capture: Optional[object] = None   # MuJoCoCapture, loaded lazily
 
 
-# ── Startup ───────────────────────────────────────────────────────────────────
+# ── Lifespan (replaces deprecated on_event("startup")) ───────────────────────
 
-@app.on_event("startup")
-async def _startup():
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
     global _analyzer, _capture
     model_name = os.environ.get("FLORENCE_MODEL", SceneAnalyzer.DEFAULT_MODEL)
     logger.info("Initialising Florence-2 (%s)…", model_name)
@@ -94,6 +87,19 @@ async def _startup():
             logger.info("MuJoCo model loaded from %s", xml_path)
         except ImportError:
             logger.warning("mujoco package not available; /capture disabled.")
+
+    yield  # server runs here
+
+
+app = FastAPI(
+    title="MuJoCo Vision Server",
+    version="1.0.0",
+    description=(
+        "Florence-2 powered scene perception for MuJoCo-CLI. "
+        "Analyses camera images and returns structured object descriptions."
+    ),
+    lifespan=_lifespan,
+)
 
 
 # ── Helper ────────────────────────────────────────────────────────────────────
