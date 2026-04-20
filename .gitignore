@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environments
+.env
+.venv
+env/
+venv/
+
+# Model weights cached by HuggingFace
+~/.cache/huggingface/
+
+# Captured scene images
+*.png
+*.jpg
+*.jpeg
+!examples/sample_scene.png
+
+# MuJoCo generated files
+*.mjb
+
+# IDE
+.vscode/
+.idea/
+*.swp
