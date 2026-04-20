@@ -268,7 +268,7 @@ class SceneAnalyzer:
                 ) from exc
             return _do_load()
 
-
+    def _run_task(
         self,
         image: Image.Image,
         task_token: str,
