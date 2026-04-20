@@ -141,6 +141,14 @@ class SceneAnalyzer:
             model_name,
             trust_remote_code=True,
         )
+        # Workaround: newer transformers calls model.language_model.config.forced_bos_token_id
+        # during generate(), but Florence2LanguageConfig does not define this attribute.
+        lang_cfg = getattr(self.model, "language_model", None)
+        if lang_cfg is not None:
+            lang_cfg = getattr(lang_cfg, "config", None)
+        for cfg in filter(None, [lang_cfg, self.model.config]):
+            if not hasattr(cfg, "forced_bos_token_id"):
+                cfg.forced_bos_token_id = None
         self.model.eval()
         logger.info("Florence-2 ready.")
 
