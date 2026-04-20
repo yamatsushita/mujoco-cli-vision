@@ -4,7 +4,7 @@ client_vision.py
 ================
 Extended Remote CLI client with automatic scene perception.
 
-Drop-in replacement for ``client.py`` that adds:
+Drop-in replacement for ``mujoco-cli.py`` that adds:
 
   1. **Automatic scene injection** — before every Copilot prompt, the client
      calls the vision server to retrieve a scene description and prepends it
@@ -21,7 +21,7 @@ Drop-in replacement for ``client.py`` that adds:
      | ``\\query <text>``   | Find specific objects in the cached scene        |
      | ``\\vision off/on``  | Temporarily disable/enable scene injection       |
 
-  3. Everything else behaves identically to the base ``RemoteCLIClient``.
+  3. All standard ``mujoco-cli.py`` commands (``\ping``, ``\shell``, ``\clear``, etc.) are
 
 Usage
 -----
@@ -71,28 +71,28 @@ from typing import Optional
 import requests
 
 # ── Import the base client ────────────────────────────────────────────────────
-# We add the parent directory so this file can coexist as a sibling of client.py
-# inside the mujoco-cli workspace, or be run from anywhere if client.py is on
-# the Python path.
+# We add the parent directory so this file can coexist as a sibling of
+# mujoco-cli.py inside the mujoco-cli workspace, or be run from anywhere if
+# mujoco-cli.py is on the Python path.
 _SCRIPT_DIR = Path(__file__).parent
 _PARENT_DIR = _SCRIPT_DIR.parent
 
 # Try to import RemoteCLIClient from different locations:
-#   1. client.py in the same directory (standalone copy)
-#   2. client.py in the parent repo root
+#   1. mujoco-cli.py in the same directory (standalone copy)
+#   2. mujoco-cli.py in the parent repo root
 _client_module = None
-for _candidate in [_SCRIPT_DIR / "client.py", _PARENT_DIR / "client.py"]:
+for _candidate in [_SCRIPT_DIR / "mujoco-cli.py", _PARENT_DIR / "mujoco-cli.py"]:
     if _candidate.exists():
         import importlib.util as _ilu
-        _spec = _ilu.spec_from_file_location("remote_cli_client", str(_candidate))
+        _spec = _ilu.spec_from_file_location("mujoco_cli", str(_candidate))
         _client_module = _ilu.module_from_spec(_spec)
         _spec.loader.exec_module(_client_module)
         break
 
 if _client_module is None:
     raise ImportError(
-        "Could not find client.py.  Place this file next to client.py "
-        "(mujoco-cli root) or copy client.py to this directory."
+        "Could not find mujoco-cli.py.  Place this file next to mujoco-cli.py "
+        "(mujoco-cli root) or copy mujoco-cli.py to this directory."
     )
 
 RemoteCLIClient = _client_module.RemoteCLIClient

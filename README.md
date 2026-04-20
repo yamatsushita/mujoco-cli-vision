@@ -38,7 +38,7 @@ Instead of hard-coding object names and positions, the system captures a scene i
 | `vision/analyzer.py` | Florence-2 wrapper — object detection, captioning, phrase grounding |
 | `vision/capture.py` | MuJoCo renderer + camera-based 2-D→3-D unprojection |
 | `vision/server.py` | FastAPI REST server exposing the vision pipeline |
-| `client_vision.py` | Extended `client.py` with automatic scene injection |
+| `client_vision.py` | Extended `mujoco-cli.py` with automatic scene injection |
 | `examples/analyze_image.py` | Standalone image analysis demo |
 | `examples/mujoco_integration.py` | Full end-to-end MuJoCo demo |
 
@@ -87,7 +87,7 @@ The first startup downloads Florence-2 weights from HuggingFace (~1.5 GB).  Subs
 ### 3 · Start the vision client
 
 ```bash
-# Link client_vision.py to the mujoco-cli directory so it can find client.py,
+# Link client_vision.py to the mujoco-cli directory so it can find mujoco-cli.py,
 # or set PYTHONPATH:
 export PYTHONPATH=/path/to/mujoco-cli
 
@@ -153,7 +153,7 @@ Render the current MuJoCo scene and analyse it (requires `--xml` on server start
 | `\query <text>` | Find specific objects in the scene |
 | `\vision on/off` | Enable/disable automatic scene injection |
 
-All standard `client.py` commands (`\ping`, `\shell`, `\clear`, etc.) are available unchanged.
+All standard `mujoco-cli.py` commands (`\ping`, `\shell`, `\clear`, etc.) are available unchanged.
 
 ---
 
