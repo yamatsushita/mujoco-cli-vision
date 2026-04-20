@@ -42,24 +42,33 @@ logger = logging.getLogger(__name__)
 
 def _patch_florence2_config_cache() -> bool:
     """
-    Patch the cached configuration_florence2.py to fix the
-    ``'Florence2LanguageConfig' object has no attribute 'forced_bos_token_id'``
-    error that occurs with transformers >= 4.49 (changed PretrainedConfig
-    __getattribute__ no longer silently returns None for unset attributes).
+    Patch cached Florence-2 remote-code files to fix incompatibilities with
+    transformers >= 5.x (tested with 5.5.4):
 
-    The bug is inside the *model's own remote code* (not in transformers itself):
-    ``Florence2LanguageConfig.__init__`` accesses ``self.forced_bos_token_id``
-    before calling ``super().__init__()``, so the attribute has not been set yet.
+    1. ``configuration_florence2.py``:
+       ``Florence2LanguageConfig.__init__`` accesses ``self.forced_bos_token_id``
+       after ``super().__init__()``, but transformers 5.x no longer sets generation
+       parameters on the config instance.  Fixed by using ``getattr`` instead.
 
-    This function finds all copies of the file in the HuggingFace modules cache,
-    replaces the bare ``self.forced_bos_token_id`` reference with a safe
-    ``getattr(self, 'forced_bos_token_id', None)``, removes the stale .pyc
-    files, and evicts any partially loaded entries from sys.modules.
+    2. ``processing_florence2.py``:
+       ``Florence2Processor.__init__`` reads ``tokenizer.additional_special_tokens``
+       which is no longer an attribute in transformers 5.x.  Fixed by using
+       ``getattr(tokenizer, 'additional_special_tokens', [])``.
 
     Returns True if at least one file was patched.
     """
-    BAD  = "if self.forced_bos_token_id is None"
-    GOOD = "if getattr(self, 'forced_bos_token_id', None) is None"
+    PATCHES = [
+        (
+            "configuration_florence2.py",
+            "if self.forced_bos_token_id is None",
+            "if getattr(self, 'forced_bos_token_id', None) is None",
+        ),
+        (
+            "processing_florence2.py",
+            "tokenizer.additional_special_tokens +",
+            "getattr(tokenizer, 'additional_special_tokens', []) +",
+        ),
+    ]
 
     # Resolve HuggingFace cache root (respects HF_HOME / HF_HUB_CACHE env vars)
     hf_cache = Path(
@@ -71,34 +80,36 @@ def _patch_florence2_config_cache() -> bool:
     modules_dir = hf_cache / "modules" / "transformers_modules"
 
     patched_any = False
-    for path_str in _glob.glob(
-        str(modules_dir / "**" / "configuration_florence2.py"), recursive=True
-    ):
-        cfg = Path(path_str)
-        try:
-            text = cfg.read_text(encoding="utf-8")
-        except OSError:
-            continue
+    for filename, BAD, GOOD in PATCHES:
+        for path_str in _glob.glob(
+            str(modules_dir / "**" / filename), recursive=True
+        ):
+            cached_file = Path(path_str)
+            try:
+                text = cached_file.read_text(encoding="utf-8")
+            except OSError:
+                continue
 
-        if BAD not in text or GOOD in text:
-            continue  # Not buggy or already patched
+            if BAD not in text or GOOD in text:
+                continue  # Not buggy or already patched
 
-        cfg.write_text(text.replace(BAD, GOOD), encoding="utf-8")
-        logger.info("Patched Florence-2 cached config: %s", cfg)
-        patched_any = True
+            cached_file.write_text(text.replace(BAD, GOOD), encoding="utf-8")
+            logger.info("Patched Florence-2 cached file: %s", cached_file)
+            patched_any = True
 
-        # Remove compiled bytecode so Python recompiles from the patched source
-        pycache = cfg.parent / "__pycache__"
-        if pycache.exists():
-            for pyc in pycache.glob("configuration_florence2*.pyc"):
-                try:
-                    pyc.unlink()
-                except OSError:
-                    pass
+            # Remove compiled bytecode so Python recompiles from patched source
+            pycache = cached_file.parent / "__pycache__"
+            if pycache.exists():
+                stem = cached_file.stem
+                for pyc in pycache.glob(f"{stem}*.pyc"):
+                    try:
+                        pyc.unlink()
+                    except OSError:
+                        pass
 
     # Evict any partially loaded module entries from Python's import cache
     for key in list(sys.modules):
-        if "configuration_florence2" in key or "florence2" in key.lower():
+        if "configuration_florence2" in key or "processing_florence2" in key or "florence2" in key.lower():
             del sys.modules[key]
 
     return patched_any
@@ -223,46 +234,39 @@ class SceneAnalyzer:
     def _load_model(self, model_name: str):
         """
         Load the Florence-2 model, auto-patching the HuggingFace modules cache
-        if the ``forced_bos_token_id`` AttributeError is encountered.
-
-        On first call the model is downloaded and the custom
-        ``configuration_florence2.py`` is executed.  Newer versions of
-        ``transformers`` changed ``PretrainedConfig.__getattribute__`` so that
-        accessing an attribute before ``super().__init__()`` raises
-        ``AttributeError`` instead of silently returning ``None``.
-        The Florence-2 remote code has a pre-``super().__init__()`` access of
-        ``self.forced_bos_token_id``, which triggers the error.
+        for known incompatibilities with transformers >= 5.x.
 
         Strategy:
-          1. Try ``from_pretrained`` normally.
-          2. If the specific ``AttributeError`` is raised, the cache file now
-             exists (the download succeeded before execution failed).
-          3. Patch the cached ``configuration_florence2.py`` and clear Python's
-             module cache.
-          4. Retry — the patched file is loaded this time.
+          1. Try ``from_pretrained`` with ``attn_implementation="eager"`` (bypasses
+             the ``_supports_sdpa`` attribute check added in transformers 5.x).
+          2. If an ``AttributeError`` related to ``forced_bos_token_id`` or
+             ``additional_special_tokens`` is raised, patch the cached remote-code
+             files and retry once.
         """
         def _do_load():
             return AutoModelForCausalLM.from_pretrained(
                 model_name,
-                torch_dtype=self.dtype,
+                dtype=self.dtype,
                 trust_remote_code=True,
+                attn_implementation="eager",
             ).to(self.device)
 
         try:
             return _do_load()
         except AttributeError as exc:
-            if "forced_bos_token_id" not in str(exc):
+            msg = str(exc)
+            if "forced_bos_token_id" not in msg and "additional_special_tokens" not in msg:
                 raise
             logger.warning(
-                "Florence-2 config incompatibility detected "
-                "(forced_bos_token_id AttributeError). "
-                "Patching cached configuration_florence2.py and retrying…"
+                "Florence-2 remote-code incompatibility detected (%s). "
+                "Patching cached files and retrying…",
+                exc,
             )
             if not _patch_florence2_config_cache():
                 raise RuntimeError(
-                    "Could not locate the cached configuration_florence2.py "
-                    "to apply the forced_bos_token_id patch.\n"
-                    "Try clearing the HuggingFace cache and restarting:\n"
+                    "Could not locate the cached Florence-2 files to apply "
+                    "the compatibility patch.\n"
+                    "Try clearing the HuggingFace modules cache and restarting:\n"
                     "  Windows: rmdir /s /q %USERPROFILE%\\.cache\\huggingface\\modules\n"
                     "  Linux/macOS: rm -rf ~/.cache/huggingface/modules"
                 ) from exc
