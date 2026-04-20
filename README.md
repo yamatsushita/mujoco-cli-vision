@@ -1,203 +1,136 @@
 # mujoco-cli-vision
 
-A vision module for [mujoco-cli](https://github.com/yamatsushita/mujoco-cli) that gives the Copilot CLI **eyes**.
+Vision-augmented extension of [mujoco-cli](https://github.com/yamatsushita/mujoco-cli).
 
-Instead of hard-coding object names and positions, the system captures a scene image from a fixed camera and uses **Florence-2** (Microsoft, MIT licence) to detect objects, generate descriptions, and optionally localise them in 3-D world space.  The resulting scene context is automatically injected into every Copilot CLI prompt so the model understands the scene without prior knowledge.
+Instead of relying on hard-coded object positions, a local **Florence-2**
+vision model renders the MuJoCo scene before every LLM planning call and
+describes what it sees.  The Copilot CLI planner receives only visual
+information (detected objects, bounding boxes, scene caption) — it has no
+prior knowledge of object names or locations.
 
 ---
 
-## Architecture
+## How it works
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│  GitHub Issue (browser)                                          │
-│    User: "move the cube to the right of the sphere"              │
-└───────────────────────────┬──────────────────────────────────────┘
-                            │ poll (client_vision.py)
-┌───────────────────────────▼──────────────────────────────────────┐
-│  VisionCLIClient                                                 │
-│    1. GET /scene  →  vision server                               │
-│         └─ returns: "1. red cube centre (0.42, 0.61) …"         │
-│    2. Augmented prompt:                                          │
-│         [scene context block]                                    │
-│         ---                                                      │
-│         User request: move the cube to the right of the sphere   │
-│    3. gh copilot -p "<augmented prompt>"  →  MuJoCo code        │
-└───────────────────────────┬──────────────────────────────────────┘
-                            │ execute
-┌───────────────────────────▼──────────────────────────────────────┐
-│  MuJoCo simulation                                               │
-│    Fixed camera renders scene  →  vision server analyses it      │
-└──────────────────────────────────────────────────────────────────┘
+User instruction
+      │
+      ▼
+mujoco-cli-vision.py          (in-process, no server)
+  ┌─────────────────────────────────────────────────────────┐
+  │  1. env.render() → numpy RGB frame                      │
+  │  2. Florence-2 analyzes the frame:                      │
+  │       <DETAILED_CAPTION>  → scene overview              │
+  │       <OD>                → detected objects + bboxes   │
+  │  3. Visual scene description replaces the programmatic  │
+  │     describe_scene() call in mujoco-cli's agent module  │
+  │  4. Enriched prompt → copilot -p "…"                   │
+  │  5. Plan executed in MuJoCo                             │
+  └─────────────────────────────────────────────────────────┘
 ```
 
-## Components
-
-| File | Role |
-|---|---|
-| `vision/analyzer.py` | Florence-2 wrapper — object detection, captioning, phrase grounding |
-| `vision/capture.py` | MuJoCo renderer + camera-based 2-D→3-D unprojection |
-| `vision/server.py` | FastAPI REST server exposing the vision pipeline |
-| `client_vision.py` | Extended `mujoco-cli.py` with automatic scene injection |
-| `examples/analyze_image.py` | Standalone image analysis demo |
-| `examples/mujoco_integration.py` | Full end-to-end MuJoCo demo |
+Florence-2 is a unified vision-language model (0.77 B parameters, MIT
+licence) from Microsoft that runs **fully locally** — no API key or cloud
+service required.
 
 ---
 
-## Why Florence-2?
+## Requirements
 
-[Florence-2](https://huggingface.co/microsoft/Florence-2-large) (Microsoft, 2024, MIT licence) is a unified vision-language foundation model that handles object detection, dense region captioning, phrase grounding, and scene description from a single prompt-based interface.
-
-| Property | Value |
-|---|---|
-| Parameters | 0.23 B (base) / 0.77 B (large) |
-| Licence | MIT |
-| HuggingFace | `microsoft/Florence-2-large` |
-| Tasks used | `<OD>`, `<DETAILED_CAPTION>`, `<DENSE_REGION_CAPTION>`, `<OPEN_VOCABULARY_DETECTION>` |
-| GPU required | No — runs on CPU (slower) or GPU (recommended) |
-| Internet required | First run only (downloads model weights, ~1.5 GB) |
-
----
-
-## Quick start
-
-### 1 · Install dependencies
-
-```bash
+```
 pip install -r requirements.txt
-# For live MuJoCo capture:
-pip install mujoco
 ```
 
-### 2 · Start the vision server
+You also need:
+- [mujoco-cli](https://github.com/yamatsushita/mujoco-cli) checked out locally
+- `copilot` CLI in PATH (`gh extension install github/gh-copilot`, then `gh copilot`)
+
+---
+
+## Usage
 
 ```bash
-# Analysis only (no live MuJoCo capture):
+# Single instruction
+python mujoco-cli-vision.py \
+    --mujoco-cli /path/to/mujoco-cli \
+    "Pick up the red cube"
+
+# Interactive mode (UNDO / CLEAR supported)
+python mujoco-cli-vision.py \
+    --mujoco-cli /path/to/mujoco-cli \
+    --interactive
+
+# Use the lighter base model (faster on CPU)
+python mujoco-cli-vision.py \
+    --mujoco-cli /path/to/mujoco-cli \
+    --model microsoft/Florence-2-base \
+    "Stack the cubes"
+
+# Set mujoco-cli path via environment variable
+export MUJOCO_CLI_PATH=/path/to/mujoco-cli
+python mujoco-cli-vision.py "Pick up the red cube"
+```
+
+All `mujoco-cli.py` flags are forwarded unchanged:
+
+| Flag | Description |
+|------|-------------|
+| `--scene N` | Scene preset 0–5 |
+| `--seed N` | Random seed for object layout |
+| `--max-retries N` | Replan up to N times on failure |
+| `--no-viewer` | Disable MuJoCo viewer window |
+| `--output path.mp4` | Record video |
+| `--interactive` | Interactive prompt loop |
+
+### Vision-specific flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--mujoco-cli PATH` | `$MUJOCO_CLI_PATH` | Path to mujoco-cli directory |
+| `--model MODEL_ID` | `microsoft/Florence-2-large` | Florence-2 HuggingFace model ID |
+| `--device DEVICE` | `auto` | `auto` / `cpu` / `cuda` / `mps` |
+
+---
+
+## Optional: standalone vision server
+
+A FastAPI server is also provided for use cases where the vision pipeline
+needs to run as a separate process (e.g., on a remote machine):
+
+```bash
 python -m vision.server --port 8765
-
-# With live MuJoCo capture:
-python -m vision.server --port 8765 --xml /path/to/your/model.xml
-
-# Use the lighter model to save memory:
-python -m vision.server --model microsoft/Florence-2-base
+curl http://localhost:8765/health
 ```
 
-The first startup downloads Florence-2 weights from HuggingFace (~1.5 GB).  Subsequent starts are instant.
-
-### 3 · Start the vision client
-
-```bash
-# Link client_vision.py to the mujoco-cli directory so it can find mujoco-cli.py,
-# or set PYTHONPATH:
-export PYTHONPATH=/path/to/mujoco-cli
-
-python client_vision.py \
-    --token ghp_xxx \
-    --name desktop \
-    --vision-url http://localhost:8765
-```
-
-The client automatically injects the current scene context into every Copilot prompt.  No changes to your prompt style are needed.
+This is **not** required for normal use of `mujoco-cli-vision.py`.
 
 ---
 
-## REST API
+## Project layout
 
-### `GET /health`
-```json
-{"status":"ok","model_loaded":true,"capture_available":true,"scene_cached":false}
 ```
-
-### `POST /analyze`
-Upload an image file (multipart `file` field) or pass `image_b64` query param.
-
-```bash
-curl -X POST http://localhost:8765/analyze \
-     -F "file=@scene.png"
-```
-
-Response:
-```json
-{
-  "scene": {
-    "caption": "A tabletop with a red cube and a blue sphere.",
-    "objects": [
-      {"label": "red cube", "bbox_pixels": [120, 200, 220, 300],
-       "center_norm": [0.27, 0.52], "area_norm": 0.032},
-      ...
-    ],
-    "image_size": [640, 480]
-  },
-  "context": "## Scene perception …\n …"
-}
-```
-
-### `GET /scene`
-Returns the cached scene from the last `/analyze` or `/capture` call.
-
-### `POST /query?text=red+cube.+blue+sphere`
-Text-conditioned detection on the cached image.
-
-### `POST /capture?camera=fixed_cam&with_depth=true`
-Render the current MuJoCo scene and analyse it (requires `--xml` on server start).
-
----
-
-## Built-in client commands
-
-| Command | Description |
-|---|---|
-| `\scene` | Show the current cached scene description |
-| `\capture [cam]` | Render the MuJoCo scene and analyse it |
-| `\analyze <path>` | Analyse a local image file |
-| `\query <text>` | Find specific objects in the scene |
-| `\vision on/off` | Enable/disable automatic scene injection |
-
-All standard `mujoco-cli.py` commands (`\ping`, `\shell`, `\clear`, etc.) are available unchanged.
-
----
-
-## 3-D localisation
-
-When the vision server is started with `--xml` and you call `/capture?with_depth=true`, the server:
-
-1. Renders an RGB image **and** a depth map from MuJoCo.
-2. Detects objects with Florence-2.
-3. Reads the depth at each bounding-box centre.
-4. Unprojects the pixel + depth to world coordinates using MuJoCo's camera intrinsics/extrinsics.
-
-The resulting `world_xyz` values are appended to each object in the response:
-
-```json
-{"label": "red cube", "center_norm": [0.27, 0.52],
- "world_xyz": [0.312, -0.045, 0.101]}
-```
-
-These 3-D coordinates are included in the scene context injected into Copilot prompts, giving the model accurate spatial information to generate correct robot control code.
-
----
-
-## Integrating with an existing MuJoCo controller
-
-1. In your simulation loop, call `capture.capture()` after each environment step (or on demand).
-2. POST the image to `/analyze`.
-3. The vision server caches the analysis; `client_vision.py` polls `/scene` before each Copilot call.
-
-```python
-# Example: post a frame from your simulation loop
-import requests
-from PIL import Image
-import io
-
-def update_vision_server(image: Image.Image, vision_url="http://localhost:8765"):
-    buf = io.BytesIO()
-    image.save(buf, format="PNG")
-    buf.seek(0)
-    requests.post(f"{vision_url}/analyze", files={"file": buf}, timeout=60)
+mujoco-cli-vision/
+├── mujoco-cli-vision.py   Entry point — loads Florence-2, patches mujoco-cli
+├── vision/
+│   ├── analyzer.py        Florence-2 wrapper (SceneAnalyzer, SceneAnalysis)
+│   ├── capture.py         MuJoCo renderer + 3-D unprojection helpers
+│   ├── server.py          Optional FastAPI server
+│   └── __init__.py
+├── examples/
+│   ├── analyze_image.py   Standalone image analysis demo
+│   └── mujoco_integration.py  End-to-end demo
+└── requirements.txt
 ```
 
 ---
 
-## Licence
+## Florence-2 compatibility
 
-MIT
+Florence-2's remote code has known incompatibilities with transformers ≥ 5.x.
+`SceneAnalyzer` automatically patches the cached model files on first load:
+
+| Symptom | Fix applied |
+|---------|-------------|
+| `AttributeError: forced_bos_token_id` | Patches `configuration_florence2.py` |
+| `AttributeError: additional_special_tokens` | Patches `processing_florence2.py` |
+| `AttributeError: _supports_sdpa` | Passes `attn_implementation="eager"` |
