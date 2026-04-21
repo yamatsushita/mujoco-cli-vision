@@ -80,39 +80,18 @@ def _bootstrap_mujoco_cli(mujoco_cli_path: str):
 
 def _build_vision_describe_scene(analyzer: SceneAnalyzer):
     """
-    Return a drop-in replacement for src.agent.describe_scene that uses
-    Florence-2 to perceive the scene visually.
+    Return a drop-in replacement for src.agent.describe_scene that relies
+    entirely on Florence-2 vision analysis.
 
     The returned function renders the current MuJoCo frame, runs it through
-    Florence-2 (<DETAILED_CAPTION> + <OD>), and produces a text block
-    suitable for inclusion in the planner prompt.
-
-    Robot proprioception (gripper state, held-object status) is retained —
-    this is internal robot state, not scene knowledge.  All scene-level
-    information (objects, table, spatial layout) comes from vision.
+    Florence-2 (<DETAILED_CAPTION> + <OD>), and returns the result as text.
+    No simulation state is read — all information comes from the image.
     """
     def describe_scene(env) -> str:
-        # Render current frame and analyse with Florence-2
-        frame = env.render()                       # numpy uint8 RGB (H, W, 3)
+        frame = env.render()
         image = Image.fromarray(frame).convert("RGB")
         scene = analyzer.analyze_scene(image)
-
-        # Robot proprioception — the robot knows its own body state
-        obs = env.get_obs()
-        grip = float(obs["finger_pos"].mean())
-        if grip > 0.035:
-            grip_desc = "open"
-        elif grip < 0.005:
-            grip_desc = "closed"
-        else:
-            grip_desc = "partially closed (likely holding an object)"
-
-        robot_block = "\n".join([
-            "=== Robot State (proprioception) ===",
-            f"Gripper: {grip_desc}",
-        ])
-
-        return scene.to_scene_text() + "\n\n" + robot_block
+        return scene.to_scene_text()
 
     return describe_scene
 
@@ -120,61 +99,65 @@ def _build_vision_describe_scene(analyzer: SceneAnalyzer):
 def _build_vision_action_reference(analyzer: SceneAnalyzer):
     """
     Return a drop-in replacement for src.agent._build_action_reference that
-    derives object information from vision instead of simulation configs.
+    derives all scene information from Florence-2 vision.
 
-    Hardcoded table/drop/clearing zone coordinates are removed.  The planner
-    is instructed to use relative actions (pick_object, stack_on, place_beside)
-    and to infer spatial relationships from the visual scene description.
+    No simulation configs, hardcoded coordinates, or hand-written scene
+    descriptions are included.  The available robot actions are listed
+    (these are the robot's capabilities, not scene assumptions), and
+    object names are taken from Florence-2 detections.
     """
     def action_reference(env) -> str:
-        # Render and detect objects visually
+        # Use Florence-2 to detect objects visually
         frame = env.render()
         image = Image.fromarray(frame).convert("RGB")
         detections = analyzer.detect_objects(image)
 
-        # Build object list from vision detections
-        obj_descriptions = []
+        # Build object list from vision detections with shape cues
+        obj_lines = []
         for det in detections:
-            label = det.label
             cx, cy = det.center_norm
             area_pct = det.area_norm * 100
-            bbox = det.bbox_pixels
-
-            # Infer shape hints from bounding box aspect ratio
-            bw = bbox[2] - bbox[0]
-            bh = bbox[3] - bbox[1]
+            bw = det.bbox_pixels[2] - det.bbox_pixels[0]
+            bh = det.bbox_pixels[3] - det.bbox_pixels[1]
             aspect = bw / bh if bh > 0 else 1.0
+
+            shape_hint = ""
             if aspect > 1.5:
-                shape_hint = "wide/flat"
+                shape_hint = " [wide/flat]"
             elif aspect < 0.67:
-                shape_hint = "tall"
-            else:
-                shape_hint = ""
+                shape_hint = " [tall]"
 
-            desc = f"'{label}' at image ({cx:.2f}, {cy:.2f}), area {area_pct:.1f}%"
-            if shape_hint:
-                desc += f" [{shape_hint}]"
-            obj_descriptions.append(desc)
+            obj_lines.append(
+                f"  - '{det.label}' at image ({cx:.2f}, {cy:.2f}), "
+                f"area {area_pct:.1f}%{shape_hint}"
+            )
 
-        if obj_descriptions:
-            obj_list = "\n  ".join(obj_descriptions)
-            obj_block = f"Visually detected objects:\n  {obj_list}"
+        if obj_lines:
+            obj_block = "Visually detected objects:\n" + "\n".join(obj_lines)
         else:
             obj_block = "No objects detected in the scene."
 
-        # Action primitives — same as original but without hardcoded coordinates
-        from src.agent import _ACTION_PRIMITIVES
-
-        return (
-            _ACTION_PRIMITIVES + "\n\n"
-            + obj_block + "\n\n"
-            "Spatial guidance:\n"
-            "- Object positions are described in the visual scene overview.\n"
-            "- Use relative actions (pick_object, stack_on, place_beside, move_aside)\n"
-            "  rather than absolute coordinates when possible.\n"
-            "- The table surface and objects are visible in the scene description.\n"
-            "- Gripper: 0.04=fully open, 0=fully closed; ~0.01-0.03 when holding.\n"
+        # Robot action capabilities (what the robot CAN do, not scene info)
+        actions = (
+            "Available HIGH-LEVEL ACTIONS:\n"
+            "  pick_object(object_name) — grasp from the top\n"
+            "  pick_object_side(object_name) — side grasp\n"
+            "  place_at([x, y, z]) — place held object at coordinates\n"
+            "  stack_on(object_name) — place held object on top of another\n"
+            "  place_beside(object_name, side, gap) — place next to another; "
+            "side: left|right|front|back\n"
+            "  move_to([x, y, z]) — move end-effector to position\n"
+            "  push_object(object_name, direction, distance) — slide object; "
+            "direction: left|right|forward|back\n"
+            "  sweep_to(object_name, target_pos) — push object to position\n"
+            "  move_aside(object_name) — move object out of the way\n"
+            "  go_home() — return to neutral pose\n"
+            "  open_gripper() / close_gripper()\n"
+            "  drop_object() — release held object\n"
+            "  rotate_wrist(angle_rad) — rotate end-effector\n"
         )
+
+        return actions + "\n" + obj_block + "\n"
 
     return action_reference
 
