@@ -29,6 +29,10 @@ venv/
 # Output
 output/
 
+# Fine-tuning data and model weights
+finetune/data/
+finetune/model/
+
 # IDE
 .vscode/
 .idea/
