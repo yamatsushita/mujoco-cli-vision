@@ -349,12 +349,22 @@ class SceneAnalyzer:
              files and retry once.
         """
         def _do_load():
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                dtype=self.dtype,
-                trust_remote_code=True,
-                attn_implementation="eager",
-            ).to(self.device)
+            # Suppress the spurious "MISSING" load report for tied weights
+            # (encoder/decoder embed_tokens + lm_head share the 'shared' embedding;
+            # they are not stored separately in the checkpoint).
+            import transformers.utils.logging as _hf_logging
+            prev_level = _hf_logging.get_verbosity()
+            _hf_logging.set_verbosity_error()
+            try:
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    dtype=self.dtype,
+                    trust_remote_code=True,
+                    attn_implementation="eager",
+                ).to(self.device)
+            finally:
+                _hf_logging.set_verbosity(prev_level)
+
             # transformers >= 5.x may not auto-tie weights for custom remote-code
             # models.  Manually tie the language model head to shared embeddings so
             # the model produces coherent output.
