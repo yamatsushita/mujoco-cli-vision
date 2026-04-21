@@ -26,6 +26,9 @@ venv/
 # MuJoCo generated files
 *.mjb
 
+# Output
+output/
+
 # IDE
 .vscode/
 .idea/

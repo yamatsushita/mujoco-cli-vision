@@ -38,6 +38,50 @@ from transformers import AutoModelForCausalLM, AutoProcessor
 logger = logging.getLogger(__name__)
 
 
+# ── EncoderDecoderCache compatibility shim ────────────────────────────────────
+
+def _apply_encoder_decoder_cache_compat() -> None:
+    """
+    Monkey-patch ``EncoderDecoderCache`` (transformers >= 5.x) to support the
+    legacy integer-subscript indexing expected by Florence-2's remote model code.
+
+    Florence-2's decoder iterates layers with ``past_key_values[idx]``, expecting
+    a 4-tuple ``(self_key, self_val, cross_key, cross_val)`` per layer.  In
+    transformers 5.x ``past_key_values`` is wrapped in an ``EncoderDecoderCache``
+    object that does not support ``[]`` indexing.
+    """
+    try:
+        from transformers.cache_utils import EncoderDecoderCache
+    except ImportError:
+        return
+
+    if getattr(EncoderDecoderCache, "_florence2_compat_patched", False):
+        return
+
+    def _edc_getitem(self, idx):
+        sac = self.self_attention_cache
+        cac = self.cross_attention_cache
+        if sac is None or not hasattr(sac, "key_cache") or idx >= len(sac.key_cache):
+            return None
+        self_kv = (sac.key_cache[idx], sac.value_cache[idx])
+        if cac is not None and hasattr(cac, "key_cache") and idx < len(cac.key_cache):
+            return self_kv + (cac.key_cache[idx], cac.value_cache[idx])
+        return self_kv
+
+    def _edc_len(self):
+        sac = self.self_attention_cache
+        if sac is not None and hasattr(sac, "key_cache"):
+            return len(sac.key_cache)
+        return 0
+
+    EncoderDecoderCache.__getitem__ = _edc_getitem
+    EncoderDecoderCache.__len__ = _edc_len
+    EncoderDecoderCache._florence2_compat_patched = True
+
+
+_apply_encoder_decoder_cache_compat()
+
+
 # ── Florence-2 config cache patcher ──────────────────────────────────────────
 
 def _patch_florence2_config_cache() -> bool:
@@ -58,11 +102,46 @@ def _patch_florence2_config_cache() -> bool:
     Returns True if at least one file was patched.
     """
     PATCHES = [
+        # configuration_florence2.py — original bug (direct attribute access)
         (
             "configuration_florence2.py",
-            "if self.forced_bos_token_id is None",
-            "if getattr(self, 'forced_bos_token_id', None) is None",
+            "if self.forced_bos_token_id is None and kwargs.get(\"force_bos_token_to_be_generated\", False):",
+            "if kwargs.get(\"force_bos_token_to_be_generated\", False):  # compat: skip forced_bos_token_id check",
         ),
+        # configuration_florence2.py — partially-patched version (getattr still fails)
+        (
+            "configuration_florence2.py",
+            "if getattr(self, 'forced_bos_token_id', None) is None and kwargs.get(\"force_bos_token_to_be_generated\", False):",
+            "if kwargs.get(\"force_bos_token_to_be_generated\", False):  # compat: skip forced_bos_token_id check",
+        ),
+        # modeling_florence2.py — _supports_sdpa accessed before language_model is set
+        (
+            "modeling_florence2.py",
+            "        return self.language_model._supports_sdpa",
+            "        if not hasattr(self, 'language_model'):\n            return False\n        return self.language_model._supports_sdpa",
+        ),
+        # modeling_florence2.py — _supports_flash_attn_2 same issue
+        (
+            "modeling_florence2.py",
+            "        return self.language_model._supports_flash_attn_2",
+            "        if not hasattr(self, 'language_model'):\n            return False\n        return self.language_model._supports_flash_attn_2",
+        ),
+        # modeling_florence2.py — EncoderDecoderCache is not subscriptable in 5.x
+        (
+            "modeling_florence2.py",
+            "            past_length = past_key_values[0][0].shape[2]",
+            (
+                "            # transformers >= 5.x uses EncoderDecoderCache instead of tuple-of-tuples\n"
+                "            if hasattr(past_key_values, 'get_seq_length'):\n"
+                "                past_length = past_key_values.get_seq_length()\n"
+                "            elif hasattr(past_key_values, 'self_attention_cache'):\n"
+                "                _sac = past_key_values.self_attention_cache\n"
+                "                past_length = _sac.get_seq_length() if hasattr(_sac, 'get_seq_length') else _sac.key_cache[0].shape[2]\n"
+                "            else:\n"
+                "                past_length = past_key_values[0][0].shape[2]"
+            ),
+        ),
+        # processing_florence2.py — additional_special_tokens removed in 5.x
         (
             "processing_florence2.py",
             "tokenizer.additional_special_tokens +",
@@ -270,18 +349,32 @@ class SceneAnalyzer:
              files and retry once.
         """
         def _do_load():
-            return AutoModelForCausalLM.from_pretrained(
+            model = AutoModelForCausalLM.from_pretrained(
                 model_name,
                 dtype=self.dtype,
                 trust_remote_code=True,
                 attn_implementation="eager",
             ).to(self.device)
+            # transformers >= 5.x may not auto-tie weights for custom remote-code
+            # models.  Manually tie the language model head to shared embeddings so
+            # the model produces coherent output.
+            try:
+                shared = model.language_model.model.shared
+                model.language_model.model.encoder.embed_tokens = shared
+                model.language_model.model.decoder.embed_tokens = shared
+                model.language_model.lm_head.weight = shared.weight
+                logger.debug("Tied Florence-2 language-model weights to shared embedding.")
+            except AttributeError as tie_exc:
+                logger.warning("Could not tie Florence-2 weights: %s", tie_exc)
+            return model
 
         try:
             return _do_load()
         except AttributeError as exc:
             msg = str(exc)
-            if "forced_bos_token_id" not in msg and "additional_special_tokens" not in msg:
+            _known = ("forced_bos_token_id", "additional_special_tokens",
+                      "_supports_sdpa", "_supports_flash_attn_2", "EncoderDecoderCache")
+            if not any(k in msg for k in _known):
                 raise
             logger.warning(
                 "Florence-2 remote-code incompatibility detected (%s). "
@@ -289,13 +382,7 @@ class SceneAnalyzer:
                 exc,
             )
             if not _patch_florence2_config_cache():
-                raise RuntimeError(
-                    "Could not locate the cached Florence-2 files to apply "
-                    "the compatibility patch.\n"
-                    "Try clearing the HuggingFace modules cache and restarting:\n"
-                    "  Windows: rmdir /s /q %USERPROFILE%\\.cache\\huggingface\\modules\n"
-                    "  Linux/macOS: rm -rf ~/.cache/huggingface/modules"
-                ) from exc
+                logger.info("No cached files needed patching (may already be patched).")
             return _do_load()
 
     def _run_task(
@@ -306,6 +393,20 @@ class SceneAnalyzer:
         max_new_tokens: int = 1024,
     ) -> dict:
         """Run a single Florence-2 task and return the post-processed dict."""
+        # Florence-2's DaViT vision tower requires square feature maps, and
+        # CLIPImageProcessor in transformers >= 5.x may not auto-resize.
+        # Resize to the processor's expected 768×768 input size.
+        orig_w, orig_h = image.width, image.height
+        proc_size = getattr(self.processor, 'image_processor', None)
+        target = 768
+        if proc_size and hasattr(proc_size, 'size'):
+            sz = proc_size.size
+            if isinstance(sz, dict):
+                target = sz.get('height', 768)
+            elif isinstance(sz, int):
+                target = sz
+        image = image.resize((target, target), Image.LANCZOS)
+
         prompt = task_token if not text_input else f"{task_token} {text_input}"
         inputs = self.processor(
             text=prompt,
@@ -331,7 +432,7 @@ class SceneAnalyzer:
         return self.processor.post_process_generation(
             generated_text,
             task=task_token,
-            image_size=(image.width, image.height),
+            image_size=(orig_w, orig_h),
         )
 
     @staticmethod
