@@ -87,8 +87,9 @@ def _build_vision_describe_scene(analyzer: SceneAnalyzer):
     Florence-2 (<DETAILED_CAPTION> + <OD>), and produces a text block
     suitable for inclusion in the planner prompt.
 
-    The robot's own joint/gripper state is still read from the environment
-    (it is not a scene property — the controller always knows its own pose).
+    Robot proprioception (gripper state, held-object status) is retained —
+    this is internal robot state, not scene knowledge.  All scene-level
+    information (objects, table, spatial layout) comes from vision.
     """
     def describe_scene(env) -> str:
         # Render current frame and analyse with Florence-2
@@ -96,31 +97,86 @@ def _build_vision_describe_scene(analyzer: SceneAnalyzer):
         image = Image.fromarray(frame).convert("RGB")
         scene = analyzer.analyze_scene(image)
 
-        # Robot state (joint / gripper — not visual, always available)
+        # Robot proprioception — the robot knows its own body state
         obs = env.get_obs()
-        ee = obs["ee_pos"].round(3).tolist()
-        qpos = obs["qpos"].round(3).tolist()
         grip = float(obs["finger_pos"].mean())
         if grip > 0.035:
-            grip_desc = "fully open"
+            grip_desc = "open"
         elif grip < 0.005:
-            grip_desc = "fully closed"
+            grip_desc = "closed"
         else:
-            grip_desc = "partially closed"
+            grip_desc = "partially closed (likely holding an object)"
 
         robot_block = "\n".join([
-            "=== Robot State ===",
-            f"End-effector position: {ee}",
-            f"Arm joints (rad): {qpos}",
-            f"Gripper: {grip:.3f} ({grip_desc}; 0.04=open, 0=closed;"
-            " ~0.01-0.03 when holding an object)",
-            "Table: centre at (0.55, 0, 0), surface at z=0.55",
-            "Drop zone: (0.55, 0.0, 0.58)",
+            "=== Robot State (proprioception) ===",
+            f"Gripper: {grip_desc}",
         ])
 
         return scene.to_scene_text() + "\n\n" + robot_block
 
     return describe_scene
+
+
+def _build_vision_action_reference(analyzer: SceneAnalyzer):
+    """
+    Return a drop-in replacement for src.agent._build_action_reference that
+    derives object information from vision instead of simulation configs.
+
+    Hardcoded table/drop/clearing zone coordinates are removed.  The planner
+    is instructed to use relative actions (pick_object, stack_on, place_beside)
+    and to infer spatial relationships from the visual scene description.
+    """
+    def action_reference(env) -> str:
+        # Render and detect objects visually
+        frame = env.render()
+        image = Image.fromarray(frame).convert("RGB")
+        detections = analyzer.detect_objects(image)
+
+        # Build object list from vision detections
+        obj_descriptions = []
+        for det in detections:
+            label = det.label
+            cx, cy = det.center_norm
+            area_pct = det.area_norm * 100
+            bbox = det.bbox_pixels
+
+            # Infer shape hints from bounding box aspect ratio
+            bw = bbox[2] - bbox[0]
+            bh = bbox[3] - bbox[1]
+            aspect = bw / bh if bh > 0 else 1.0
+            if aspect > 1.5:
+                shape_hint = "wide/flat"
+            elif aspect < 0.67:
+                shape_hint = "tall"
+            else:
+                shape_hint = ""
+
+            desc = f"'{label}' at image ({cx:.2f}, {cy:.2f}), area {area_pct:.1f}%"
+            if shape_hint:
+                desc += f" [{shape_hint}]"
+            obj_descriptions.append(desc)
+
+        if obj_descriptions:
+            obj_list = "\n  ".join(obj_descriptions)
+            obj_block = f"Visually detected objects:\n  {obj_list}"
+        else:
+            obj_block = "No objects detected in the scene."
+
+        # Action primitives — same as original but without hardcoded coordinates
+        from src.agent import _ACTION_PRIMITIVES
+
+        return (
+            _ACTION_PRIMITIVES + "\n\n"
+            + obj_block + "\n\n"
+            "Spatial guidance:\n"
+            "- Object positions are described in the visual scene overview.\n"
+            "- Use relative actions (pick_object, stack_on, place_beside, move_aside)\n"
+            "  rather than absolute coordinates when possible.\n"
+            "- The table surface and objects are visible in the scene description.\n"
+            "- Gripper: 0.04=fully open, 0=fully closed; ~0.01-0.03 when holding.\n"
+        )
+
+    return action_reference
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +266,9 @@ def main():
     _agent.describe_scene = vision_describe
     _src.describe_scene = vision_describe
     mujoco_cli_mod.describe_scene = vision_describe
+
+    # Patch _build_action_reference to use vision-derived object info
+    _agent._build_action_reference = _build_vision_action_reference(analyzer)
 
     # Forward the remaining argv to mujoco-cli.main()
     sys.argv = [sys.argv[0]] + forwarded_argv
