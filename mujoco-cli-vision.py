@@ -202,9 +202,14 @@ def main():
     # Load mujoco-cli and its src/ package
     mujoco_cli_mod = _bootstrap_mujoco_cli(mujoco_cli_path)
 
-    # Patch describe_scene in src.agent with the vision version
+    # Patch describe_scene everywhere it was imported so ALL call sites
+    # (including mujoco-cli.py's module-level binding) use the vision version.
     from src import agent as _agent  # noqa: E402 (available after _bootstrap)
-    _agent.describe_scene = _build_vision_describe_scene(analyzer)
+    import src as _src
+    vision_describe = _build_vision_describe_scene(analyzer)
+    _agent.describe_scene = vision_describe
+    _src.describe_scene = vision_describe
+    mujoco_cli_mod.describe_scene = vision_describe
 
     # Forward the remaining argv to mujoco-cli.main()
     sys.argv = [sys.argv[0]] + forwarded_argv
