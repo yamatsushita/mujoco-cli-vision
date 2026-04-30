@@ -442,6 +442,135 @@ def _build_vision_action_reference(cache: PerceptionCache):
 
 
 # ---------------------------------------------------------------------------
+# Fuzzy object name resolution
+# ---------------------------------------------------------------------------
+
+def _normalize(name: str) -> set[str]:
+    """Split a name into lowercase keyword tokens for fuzzy matching."""
+    import re
+    return set(re.split(r'[\s_\-]+', name.lower().strip()))
+
+
+def _fuzzy_match(query: str, candidates: list[str]) -> Optional[str]:
+    """
+    Find the best matching candidate for *query* using keyword overlap.
+
+    Scoring:
+      1. Exact match (case-insensitive, underscores ↔ spaces) → immediate win
+      2. Token overlap score = |intersection| / |union|  (Jaccard similarity)
+      3. Substring containment bonus
+
+    Returns the best candidate, or None if no reasonable match is found.
+    """
+    q_norm = query.lower().replace(' ', '_').strip()
+    q_tokens = _normalize(query)
+
+    best, best_score = None, 0.0
+    for cand in candidates:
+        c_norm = cand.lower().replace(' ', '_').strip()
+
+        # Exact match
+        if q_norm == c_norm:
+            return cand
+
+        # Token overlap (Jaccard)
+        c_tokens = _normalize(cand)
+        inter = q_tokens & c_tokens
+        union = q_tokens | c_tokens
+        score = len(inter) / len(union) if union else 0.0
+
+        # Substring bonus: if the query or candidate contains the other
+        if q_norm in c_norm or c_norm in q_norm:
+            score += 0.3
+
+        # Colour word bonus: strong signal if colour matches
+        colours = {'red', 'blue', 'green', 'yellow', 'orange', 'purple',
+                   'white', 'black', 'pink', 'brown', 'gray', 'grey', 'cyan'}
+        q_colours = q_tokens & colours
+        c_colours = c_tokens & colours
+        if q_colours and q_colours == c_colours:
+            score += 0.3
+
+        if score > best_score:
+            best_score = score
+            best = cand
+
+    # Require at least some overlap to avoid nonsense matches
+    return best if best_score >= 0.25 else None
+
+
+def _patch_fuzzy_object_names():
+    """
+    Monkey-patch ``RobotController.get_object_pos`` so that object names
+    from the LLM (e.g. "red object", "the blue block") are fuzzy-matched
+    against the actual MuJoCo body names (e.g. "red_cube", "blue_cube").
+    """
+    from src.robot import RobotController
+
+    _original_get_object_pos = RobotController.get_object_pos
+
+    def _fuzzy_get_object_pos(self, obj_name):
+        # Try exact match first
+        result = _original_get_object_pos(self, obj_name)
+        if result is not None:
+            return result
+
+        # Fuzzy match against known body names
+        known = list(self.env.obj_body_ids.keys())
+        match = _fuzzy_match(obj_name, known)
+        if match is not None:
+            print(f"  \U0001f50d Resolved '{obj_name}' → '{match}'")
+            return _original_get_object_pos(self, match)
+
+        return None
+
+    RobotController.get_object_pos = _fuzzy_get_object_pos
+
+    # Also patch _get_half_height, _get_obj_yaw, _activate_weld,
+    # _check_grasp_alignment, _has_finger_contact_with, and _teleport_obj
+    # which all take obj_name and look up MuJoCo bodies directly.
+    _original_get_half_height = RobotController._get_half_height
+    _original_get_obj_yaw = RobotController._get_obj_yaw
+    _original_activate_weld = RobotController._activate_weld
+    _original_has_finger_contact = RobotController._has_finger_contact_with
+    _original_check_alignment = RobotController._check_grasp_alignment
+    _original_teleport = RobotController._teleport_obj
+
+    def _resolve(self, obj_name):
+        """Resolve obj_name to the closest known body name."""
+        if obj_name in self.env.obj_body_ids:
+            return obj_name
+        known = list(self.env.obj_body_ids.keys())
+        match = _fuzzy_match(obj_name, known)
+        return match if match is not None else obj_name
+
+    def _fuzzy_get_half_height(self, obj_name):
+        return _original_get_half_height(self, _resolve(self, obj_name))
+
+    def _fuzzy_get_obj_yaw(self, obj_name):
+        return _original_get_obj_yaw(self, _resolve(self, obj_name))
+
+    def _fuzzy_activate_weld(self, obj_name):
+        return _original_activate_weld(self, _resolve(self, obj_name))
+
+    def _fuzzy_has_finger_contact(self, obj_name):
+        return _original_has_finger_contact(self, _resolve(self, obj_name))
+
+    def _fuzzy_check_alignment(self, obj_name, min_dot=0.75):
+        return _original_check_alignment(self, _resolve(self, obj_name), min_dot)
+
+    def _fuzzy_teleport(self, obj_name, world_pos, world_quat=None):
+        return _original_teleport(self, _resolve(self, obj_name), world_pos, world_quat)
+
+    RobotController._get_half_height = _fuzzy_get_half_height
+    RobotController._get_obj_yaw = _fuzzy_get_obj_yaw
+    RobotController._activate_weld = _fuzzy_activate_weld
+    RobotController._has_finger_contact_with = _fuzzy_has_finger_contact
+    RobotController._check_grasp_alignment = _fuzzy_check_alignment
+    RobotController._teleport_obj = _fuzzy_teleport
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -564,6 +693,9 @@ def main():
     mujoco_cli_mod.describe_scene = vision_describe
 
     _agent._build_action_reference = _build_vision_action_reference(cache)
+
+    # ── Patch RobotController with fuzzy object name resolution ───────────
+    _patch_fuzzy_object_names()
 
     # ── Forward to mujoco-cli ─────────────────────────────────────────────
     sys.argv = [sys.argv[0]] + forwarded_argv
