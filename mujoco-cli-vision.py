@@ -120,18 +120,23 @@ def _inject_vision_camera():
     if "vision_cam" in header:
         return  # already injected
 
-    # Insert vision_cam after front_cam line
+    # Insert vision_cam after front_cam element (which may span multiple lines)
     marker = '<camera name="front_cam"'
     idx = header.find(marker)
     if idx < 0:
         return
 
-    # Find end of front_cam line
-    eol = header.find("\n", idx)
-    if eol < 0:
+    # Find the closing '/>' of the front_cam element
+    close = header.find("/>", idx)
+    if close < 0:
         return
+    # Move past '/>' and the newline
+    insert_pos = close + 2
+    eol = header.find("\n", insert_pos)
+    if eol >= 0:
+        insert_pos = eol + 1
 
-    _sb._SCENE_HEADER = header[:eol + 1] + "\n" + _VISION_CAM_XML + "\n" + header[eol + 1:]
+    _sb._SCENE_HEADER = header[:insert_pos] + "\n" + _VISION_CAM_XML + "\n" + header[insert_pos:]
 
 
 # ---------------------------------------------------------------------------
