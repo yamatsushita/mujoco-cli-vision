@@ -41,6 +41,36 @@ except ImportError:
     )
 
 
+# Default perception camera parameters: positioned to see the entire
+# Franka Panda workspace (arm + table + objects) from a slightly elevated
+# 3/4 angle.  Provides good depth contrast for pose estimation.
+VISION_CAM_POS = np.array([1.3, -0.75, 1.55])
+VISION_CAM_LOOKAT = np.array([0.50, 0.0, 0.55])
+VISION_CAM_FOVY = 52.0  # degrees
+
+
+def inject_vision_camera(model, data, cam_name: str = "vision_cam") -> int:
+    """
+    Check whether a named camera exists in the model.  If it does, return
+    its ID.  MuJoCo does not support adding cameras at runtime, so the
+    camera must be defined in the XML.  This function simply resolves the
+    name to an ID and logs a warning if it is missing.
+
+    Returns the camera ID, or -1 if not found.
+    """
+    try:
+        cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, cam_name)
+    except Exception:
+        cam_id = -1
+    if cam_id < 0:
+        logger.warning(
+            "Camera '%s' not found in model.  "
+            "Using camera index 0 (front_cam) as fallback.",
+            cam_name,
+        )
+    return cam_id
+
+
 class MuJoCoCapture:
     """
     Renders MuJoCo scenes and converts 2-D detections to 3-D world coords.

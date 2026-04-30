@@ -12,5 +12,6 @@ Primary components:
 
 from .analyzer import SceneAnalyzer
 from .capture import MuJoCoCapture
+from .pose_estimator import PoseEstimator, ObjectPose
 
-__all__ = ["SceneAnalyzer", "MuJoCoCapture"]
+__all__ = ["SceneAnalyzer", "MuJoCoCapture", "PoseEstimator", "ObjectPose"]
