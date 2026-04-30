@@ -157,6 +157,7 @@ class PerceptionCache:
         width: int = 640,
         height: int = 480,
         output_rgbd: Optional[str] = None,
+        show_rgbd: bool = False,
     ):
         self.analyzer = analyzer
         self.pose_estimator = pose_estimator
@@ -164,6 +165,7 @@ class PerceptionCache:
         self.width = width
         self.height = height
         self.output_rgbd = output_rgbd
+        self.show_rgbd = show_rgbd
         self._frame_counter = 0
 
         # Cached results
@@ -202,6 +204,10 @@ class PerceptionCache:
         # Save RGB + depth if --output_rgbd was specified
         if self.output_rgbd:
             self._save_rgbd(rgb_image, depth_map)
+
+        # Display RGB + depth if --show_rgbd was specified
+        if self.show_rgbd:
+            self._display_rgbd(rgb_image, depth_map)
 
         # Florence-2: scene caption + object detection (RGB only)
         scene_analysis = self.analyzer.analyze_scene(rgb_image)
@@ -247,6 +253,40 @@ class PerceptionCache:
         np.save(depth_npy_path, depth_map)
 
         print(f"\U0001f4f7 Saved RGB+D frame {idx}: {rgb_path}, {depth_png_path}", flush=True)
+
+    def _display_rgbd(self, rgb_image: Image, depth_map: np.ndarray) -> None:
+        """Display the captured RGB image and depth map side by side."""
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
+            print("\u26a0\ufe0f  matplotlib not installed — cannot display RGB+D. "
+                  "Install with: pip install matplotlib", flush=True)
+            self.show_rgbd = False  # disable for future calls
+            return
+
+        fig, (ax_rgb, ax_depth) = plt.subplots(1, 2, figsize=(12, 5))
+        fig.suptitle(f"Vision Camera Observation (frame {self._frame_counter - 1})",
+                     fontsize=13)
+
+        ax_rgb.imshow(rgb_image)
+        ax_rgb.set_title("RGB")
+        ax_rgb.axis("off")
+
+        # Colourised depth — mask out invalid (zero) pixels
+        depth_vis = depth_map.copy()
+        valid = depth_vis > 0
+        if valid.any():
+            vmin, vmax = depth_vis[valid].min(), depth_vis[valid].max()
+        else:
+            vmin, vmax = 0.0, 1.0
+        im = ax_depth.imshow(depth_vis, cmap="turbo", vmin=vmin, vmax=vmax)
+        ax_depth.set_title("Depth (metres)")
+        ax_depth.axis("off")
+        fig.colorbar(im, ax=ax_depth, fraction=0.046, pad=0.04, label="m")
+
+        plt.tight_layout()
+        plt.show(block=False)
+        plt.pause(0.1)
 
     @property
     def caption(self) -> str:
@@ -391,6 +431,7 @@ def _parse_vision_args():
     device = "auto"
     use_fp = True
     output_rgbd = ""
+    show_rgbd = False
     forwarded = []
     i = 0
     while i < len(argv):
@@ -422,13 +463,16 @@ def _parse_vision_args():
         elif arg.startswith("--output_rgbd="):
             output_rgbd = arg.split("=", 1)[1]
             i += 1
+        elif arg == "--show_rgbd":
+            show_rgbd = True
+            i += 1
         elif arg in ("-h", "--help"):
             _print_help()
             sys.exit(0)
         else:
             forwarded.append(arg)
             i += 1
-    return mujoco_cli_path, model_id, device, use_fp, output_rgbd, forwarded
+    return mujoco_cli_path, model_id, device, use_fp, output_rgbd, show_rgbd, forwarded
 
 
 def _print_help():
@@ -440,13 +484,14 @@ def _print_help():
     print("  --device DEVICE         Torch device: auto / cpu / cuda / mps (default: auto)")
     print("  --no-foundation-pose    Disable FoundationPose (use depth fallback only)")
     print("  --output_rgbd DIR       Save captured RGB + depth images to DIR")
+    print("  --show_rgbd             Display RGB + depth map in a window")
     print()
     print("All other flags are forwarded to mujoco-cli.py (--scene, --seed,")
     print("--max-retries, --no-viewer, --output, --fps, --interactive, ...).")
 
 
 def main():
-    mujoco_cli_path, model_id, device, use_fp, output_rgbd, forwarded_argv = _parse_vision_args()
+    mujoco_cli_path, model_id, device, use_fp, output_rgbd, show_rgbd, forwarded_argv = _parse_vision_args()
 
     if not mujoco_cli_path:
         print(
@@ -477,6 +522,7 @@ def main():
         pose_estimator=pose_estimator,
         cam_name="vision_cam",
         output_rgbd=output_rgbd or None,
+        show_rgbd=show_rgbd,
     )
 
     # ── Patch describe_scene and action_reference ─────────────────────────
