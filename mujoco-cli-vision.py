@@ -156,12 +156,15 @@ class PerceptionCache:
         cam_name: str = "vision_cam",
         width: int = 640,
         height: int = 480,
+        output_rgbd: Optional[str] = None,
     ):
         self.analyzer = analyzer
         self.pose_estimator = pose_estimator
         self.cam_name = cam_name
         self.width = width
         self.height = height
+        self.output_rgbd = output_rgbd
+        self._frame_counter = 0
 
         # Cached results
         self._caption: str = ""
@@ -196,6 +199,10 @@ class PerceptionCache:
             width=self.width, height=self.height, camera=cam,
         )
 
+        # Save RGB + depth if --output_rgbd was specified
+        if self.output_rgbd:
+            self._save_rgbd(rgb_image, depth_map)
+
         # Florence-2: scene caption + object detection (RGB only)
         scene_analysis = self.analyzer.analyze_scene(rgb_image)
         self._caption = scene_analysis.caption
@@ -217,6 +224,29 @@ class PerceptionCache:
             detections=det_dicts,
         )
         self._pose_mode = self.pose_estimator.mode
+
+    def _save_rgbd(self, rgb_image: Image, depth_map: np.ndarray) -> None:
+        """Save the captured RGB image and depth map to the output directory."""
+        out_dir = Path(self.output_rgbd)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        idx = self._frame_counter
+        self._frame_counter += 1
+
+        # Save RGB as PNG
+        rgb_path = out_dir / f"rgb_{idx:04d}.png"
+        rgb_image.save(rgb_path)
+
+        # Save depth as 16-bit PNG (millimetres) for lossless storage
+        # and as .npy for exact float values
+        depth_mm = (depth_map * 1000.0).astype(np.uint16)
+        depth_png_path = out_dir / f"depth_{idx:04d}.png"
+        Image.fromarray(depth_mm).save(depth_png_path)
+
+        depth_npy_path = out_dir / f"depth_{idx:04d}.npy"
+        np.save(depth_npy_path, depth_map)
+
+        print(f"\U0001f4f7 Saved RGB+D frame {idx}: {rgb_path}, {depth_png_path}", flush=True)
 
     @property
     def caption(self) -> str:
@@ -350,7 +380,7 @@ def _parse_vision_args():
     """
     Parse the vision-specific flags from sys.argv.
 
-    Returns (mujoco_cli_path, model_id, device, use_fp, forwarded_argv).
+    Returns (mujoco_cli_path, model_id, device, use_fp, output_rgbd, forwarded_argv).
     We cannot use argparse.parse_known_args here without special care
     because mujoco-cli also has positional args that argparse may steal,
     so we do a simple manual scan.
@@ -360,6 +390,7 @@ def _parse_vision_args():
     model_id = "microsoft/Florence-2-large"
     device = "auto"
     use_fp = True
+    output_rgbd = ""
     forwarded = []
     i = 0
     while i < len(argv):
@@ -385,13 +416,19 @@ def _parse_vision_args():
         elif arg == "--no-foundation-pose":
             use_fp = False
             i += 1
+        elif arg in ("--output_rgbd",) and i + 1 < len(argv):
+            output_rgbd = argv[i + 1]
+            i += 2
+        elif arg.startswith("--output_rgbd="):
+            output_rgbd = arg.split("=", 1)[1]
+            i += 1
         elif arg in ("-h", "--help"):
             _print_help()
             sys.exit(0)
         else:
             forwarded.append(arg)
             i += 1
-    return mujoco_cli_path, model_id, device, use_fp, forwarded
+    return mujoco_cli_path, model_id, device, use_fp, output_rgbd, forwarded
 
 
 def _print_help():
@@ -402,13 +439,14 @@ def _print_help():
     print("  --model MODEL_ID        Florence-2 model (default: microsoft/Florence-2-large)")
     print("  --device DEVICE         Torch device: auto / cpu / cuda / mps (default: auto)")
     print("  --no-foundation-pose    Disable FoundationPose (use depth fallback only)")
+    print("  --output_rgbd DIR       Save captured RGB + depth images to DIR")
     print()
     print("All other flags are forwarded to mujoco-cli.py (--scene, --seed,")
     print("--max-retries, --no-viewer, --output, --fps, --interactive, ...).")
 
 
 def main():
-    mujoco_cli_path, model_id, device, use_fp, forwarded_argv = _parse_vision_args()
+    mujoco_cli_path, model_id, device, use_fp, output_rgbd, forwarded_argv = _parse_vision_args()
 
     if not mujoco_cli_path:
         print(
@@ -438,6 +476,7 @@ def main():
         analyzer=analyzer,
         pose_estimator=pose_estimator,
         cam_name="vision_cam",
+        output_rgbd=output_rgbd or None,
     )
 
     # ── Patch describe_scene and action_reference ─────────────────────────
