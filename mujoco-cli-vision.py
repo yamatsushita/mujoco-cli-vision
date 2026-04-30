@@ -232,7 +232,7 @@ class PerceptionCache:
         self._pose_mode = self.pose_estimator.mode
 
     def _save_rgbd(self, rgb_image: Image, depth_map: np.ndarray) -> None:
-        """Save the captured RGB image and depth map to the output directory."""
+        """Save the captured RGB image, raw depth, and colourised depth visualisation."""
         out_dir = Path(self.output_rgbd)
         out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -246,13 +246,42 @@ class PerceptionCache:
         # Save depth as 16-bit PNG (millimetres) for lossless storage
         # and as .npy for exact float values
         depth_mm = (depth_map * 1000.0).astype(np.uint16)
-        depth_png_path = out_dir / f"depth_{idx:04d}.png"
-        Image.fromarray(depth_mm).save(depth_png_path)
+        depth_raw_path = out_dir / f"depth_{idx:04d}.png"
+        Image.fromarray(depth_mm).save(depth_raw_path)
 
         depth_npy_path = out_dir / f"depth_{idx:04d}.npy"
         np.save(depth_npy_path, depth_map)
 
-        print(f"\U0001f4f7 Saved RGB+D frame {idx}: {rgb_path}, {depth_png_path}", flush=True)
+        # Save colourised depth visualisation
+        depth_vis_path = out_dir / f"depth_vis_{idx:04d}.png"
+        self._save_depth_vis(depth_map, depth_vis_path)
+
+        print(f"\U0001f4f7 Saved RGB+D frame {idx}: {rgb_path}, {depth_raw_path}, {depth_vis_path}",
+              flush=True)
+
+    @staticmethod
+    def _save_depth_vis(depth_map: np.ndarray, path: Path) -> None:
+        """Save a colourised depth map as an RGB PNG using the turbo colourmap."""
+        try:
+            import matplotlib.cm as cm
+        except ImportError:
+            # matplotlib unavailable — skip visualisation
+            return
+
+        valid = depth_map > 0
+        if valid.any():
+            vmin, vmax = depth_map[valid].min(), depth_map[valid].max()
+        else:
+            vmin, vmax = 0.0, 1.0
+
+        # Normalise to [0, 1] and apply turbo colourmap
+        rng = vmax - vmin if vmax > vmin else 1.0
+        normed = np.clip((depth_map - vmin) / rng, 0.0, 1.0)
+        normed[~valid] = 0.0
+        coloured = (cm.turbo(normed)[:, :, :3] * 255).astype(np.uint8)
+        # Mark invalid pixels as black
+        coloured[~valid] = 0
+        Image.fromarray(coloured).save(path)
 
     def _display_rgbd(self, rgb_image: Image, depth_map: np.ndarray) -> None:
         """Display the captured RGB image and depth map side by side."""
