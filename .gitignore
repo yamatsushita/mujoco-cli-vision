@@ -29,6 +29,10 @@ venv/
 # Output
 output/
 
+# RGB+D perception output
+output_rgbd/
+*.npy
+
 # Fine-tuning data and model weights
 finetune/data/
 finetune/model/
