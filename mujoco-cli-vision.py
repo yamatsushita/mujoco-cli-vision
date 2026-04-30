@@ -216,6 +216,9 @@ class PerceptionCache:
         self._object_poses: list[ObjectPose] = []
         self._pose_mode: str = "unknown"
         self._capture: Optional[MuJoCoCapture] = None
+        self._table_z: Optional[float] = None
+        self._table_centre: Optional[list[float]] = None
+        self._ee_pos: Optional[np.ndarray] = None
 
     def perceive(self, env) -> None:
         """
@@ -273,6 +276,75 @@ class PerceptionCache:
             detections=det_dicts,
         )
         self._pose_mode = self.pose_estimator.mode
+
+        # Estimate table surface from depth map + object positions
+        self._estimate_table_surface(depth_map, camera_params)
+
+        # Read robot end-effector position (robot knows its own kinematics)
+        import mujoco
+        ee_site_id = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_SITE, 'end_effector')
+        if ee_site_id >= 0:
+            mujoco.mj_forward(env.model, env.data)
+            self._ee_pos = env.data.site_xpos[ee_site_id].copy()
+
+    def _estimate_table_surface(self, depth_map: np.ndarray, camera_params: dict) -> None:
+        """
+        Estimate the table surface height and centre from the depth map.
+
+        Strategy: the table is the dominant flat surface. We unproject a grid
+        of points from the lower-centre region of the depth image (where the
+        table is most likely visible) and take the mode of z-coordinates.
+        """
+        H, W = depth_map.shape[:2]
+        f = camera_params["f"]
+        cx = camera_params["cx"]
+        cy = camera_params["cy"]
+        cam_pos = camera_params["position"]
+        R = camera_params["rotation_matrix"]
+
+        # Sample points from the lower-centre band of the image (likely table)
+        y_start = int(H * 0.5)
+        y_end = int(H * 0.85)
+        x_start = int(W * 0.2)
+        x_end = int(W * 0.8)
+        step = max(1, (y_end - y_start) // 20)
+
+        world_points = []
+        for v in range(y_start, y_end, step):
+            for u in range(x_start, x_end, step):
+                d = float(depth_map[v, u])
+                if d <= 0:
+                    continue
+                x_cam = (u - cx) / f
+                y_cam = -(v - cy) / f
+                dir_cam = np.array([x_cam, y_cam, -1.0])
+                point_cam = dir_cam * d / np.linalg.norm(dir_cam)
+                p_world = cam_pos + R @ point_cam
+                world_points.append(p_world)
+
+        if not world_points:
+            return
+
+        zs = np.array([p[2] for p in world_points])
+
+        # The table is the most frequent z-level; use histogram mode
+        z_min, z_max = zs.min(), zs.max()
+        if z_max - z_min < 0.01:
+            self._table_z = float(np.median(zs))
+        else:
+            bins = np.linspace(z_min, z_max, 30)
+            counts, edges = np.histogram(zs, bins=bins)
+            peak_bin = np.argmax(counts)
+            mask = (zs >= edges[peak_bin]) & (zs < edges[peak_bin + 1])
+            self._table_z = float(np.median(zs[mask]))
+
+        # Estimate table centre as the centroid of points near table_z
+        table_pts = [p for p in world_points if abs(p[2] - self._table_z) < 0.05]
+        if table_pts:
+            arr = np.array(table_pts)
+            self._table_centre = [float(np.median(arr[:, 0])),
+                                  float(np.median(arr[:, 1])),
+                                  float(self._table_z)]
 
     def _save_rgbd(self, rgb_image: Image, depth_map: np.ndarray) -> None:
         """Save the captured RGB image, raw depth, and colourised depth visualisation."""
@@ -372,6 +444,18 @@ class PerceptionCache:
     def pose_mode(self) -> str:
         return self._pose_mode
 
+    @property
+    def table_z(self) -> Optional[float]:
+        return self._table_z
+
+    @property
+    def table_centre(self) -> Optional[list[float]]:
+        return self._table_centre
+
+    @property
+    def ee_pos(self) -> Optional[np.ndarray]:
+        return self._ee_pos
+
 
 # ---------------------------------------------------------------------------
 # Vision-based describe_scene (RGB+D)
@@ -396,6 +480,12 @@ def _build_vision_describe_scene(cache: PerceptionCache):
             "",
         ]
 
+        # Robot state (from proprioception — the robot knows its own joints)
+        if cache.ee_pos is not None:
+            ee = cache.ee_pos
+            lines.append(f"Robot end-effector position: ({ee[0]:.3f}, {ee[1]:.3f}, {ee[2]:.3f})")
+            lines.append("")
+
         if cache.object_poses:
             lines.append("Detected objects with estimated poses:")
             for i, pose in enumerate(cache.object_poses, start=1):
@@ -411,11 +501,18 @@ def _build_vision_describe_scene(cache: PerceptionCache):
         else:
             lines.append("  (no objects detected)")
 
+        # Table surface estimated from depth
+        lines.append("")
+        if cache.table_z is not None:
+            lines.append(f"Table surface height (estimated from depth): z={cache.table_z:.3f}")
+        if cache.table_centre is not None:
+            tc = cache.table_centre
+            lines.append(f"Table centre (estimated): ({tc[0]:.3f}, {tc[1]:.3f}, {tc[2]:.3f})")
+
         lines += [
             "",
-            "Coordinate frame: MuJoCo world frame (metres).",
-            "Table: centre at (0.55, 0, 0), surface at z=0.55.",
-            "Drop zone (neutral area): (0.55, 0.0, 0.58).",
+            "Coordinate frame: robot base frame (metres).",
+            "All positions are estimated from RGB+D camera observation.",
         ]
         return "\n".join(lines)
 
@@ -471,15 +568,36 @@ def _build_vision_action_reference(cache: PerceptionCache):
             "  rotate_wrist(angle_rad) — rotate end-effector\n"
         )
 
-        return (
-            actions + "\n" + obj_block + "\n\n"
-            "Table surface at z=0.55. Objects rest at z≈0.55+half_height. "
-            "Drop zone: [0.55, 0.0, 0.58].\n"
+        # Scene geometry estimated from depth (no hardcoded values)
+        scene_info_lines = []
+        if cache.table_z is not None:
+            tz = cache.table_z
+            scene_info_lines.append(
+                f"Table surface at z≈{tz:.3f} (estimated from depth). "
+                f"Objects rest at z≈{tz:.3f}+half_height."
+            )
+            # Suggest a drop zone above the table centre
+            if cache.table_centre is not None:
+                tc = cache.table_centre
+                drop_z = tz + 0.03
+                scene_info_lines.append(
+                    f"Table centre: ({tc[0]:.2f}, {tc[1]:.2f}, {tc[2]:.2f}). "
+                    f"Drop zone (above table): [{tc[0]:.2f}, {tc[1]:.2f}, {drop_z:.2f}]."
+                )
+        scene_info_lines.append(
             "Gripper: 0.04=fully open, 0=fully closed; "
-            "fingers slip to ~0.01-0.03 when holding an object.\n"
-            "Object positions are in MuJoCo world coordinates (metres).\n"
-            "Use the detected positions to plan precise pick/place actions.\n"
+            "fingers slip to ~0.01-0.03 when holding an object."
         )
+        scene_info_lines.append(
+            "All positions are estimated from RGB+D camera observation "
+            "in robot base coordinates (metres)."
+        )
+        scene_info_lines.append(
+            "Use the detected object positions to plan precise pick/place actions."
+        )
+
+        scene_info = "\n".join(scene_info_lines)
+        return actions + "\n" + obj_block + "\n\n" + scene_info + "\n"
 
     return action_reference
 
