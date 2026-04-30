@@ -93,6 +93,49 @@ def _bootstrap_mujoco_cli(mujoco_cli_path: str):
 
 
 # ---------------------------------------------------------------------------
+# Relax Panda joint limits for wider workspace
+# ---------------------------------------------------------------------------
+
+# Expanded joint ranges (radians).  Only joints that are too restrictive
+# for general manipulation are widened; the rest keep their defaults.
+_RELAXED_JOINT_RANGES = {
+    'joint2': (-2.50,  2.50),    # shoulder: ±143° (was ±101°)
+    'joint4': (-3.0718, 0.50),   # elbow: allow extension (was -3.07 to -0.07)
+    'joint6': (-1.00,  3.7525),  # wrist: allow negative rotation (was -0.02 to 3.75)
+}
+
+
+def _patch_joint_limits():
+    """
+    Monkey-patch ``RobotEnv.__init__`` to relax joint limits and matching
+    actuator ctrl ranges after the MuJoCo model is loaded.
+
+    This gives the arm a wider reachable workspace — it can move the
+    end-effector higher and perform side grasps more freely.
+    """
+    import mujoco as _mj
+    from src.env import RobotEnv
+
+    _original_init = RobotEnv.__init__
+
+    def _relaxed_init(self, *args, **kwargs):
+        _original_init(self, *args, **kwargs)
+        # Widen joint limits
+        for jname, (lo, hi) in _RELAXED_JOINT_RANGES.items():
+            jid = _mj.mj_name2id(self.model, _mj.mjtObj.mjOBJ_JOINT, jname)
+            if jid < 0:
+                continue
+            self.model.jnt_range[jid] = [lo, hi]
+            # Also widen the matching actuator ctrl range
+            for aid in range(self.model.nu):
+                ajid = self.model.actuator_trnid[aid, 0]
+                if self.model.actuator_trntype[aid] == 0 and ajid == jid:
+                    self.model.actuator_ctrlrange[aid] = [lo, hi]
+
+    RobotEnv.__init__ = _relaxed_init
+
+
+# ---------------------------------------------------------------------------
 # Inject vision_cam into mujoco-cli's scene builder XML
 # ---------------------------------------------------------------------------
 
@@ -673,6 +716,7 @@ def main():
     # ── Load mujoco-cli and inject vision camera ──────────────────────────
     mujoco_cli_mod = _bootstrap_mujoco_cli(mujoco_cli_path)
     _inject_vision_camera()
+    _patch_joint_limits()
 
     # ── Build perception cache ────────────────────────────────────────────
     cache = PerceptionCache(
